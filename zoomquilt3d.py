@@ -818,11 +818,16 @@ class ZoomquiltPipeline:
     #  Upscale helpers
     # ======================================================================
     @staticmethod
-    def _scale_filter(target, fit):
+    def _scale_filter(target, fit, overscan=1.0):
         """
         ffmpeg -vf string to upscale square frames to `target` (w, h) keeping
         aspect via cover (fill+center-crop) or fit (letterbox-pad). Lanczos
         scaler. Returns None if target is None (keep source size).
+
+        `overscan` > 1 zooms the cover in and crops more off every side, so the
+        visible left/right edges land INSIDE the consistent center instead of
+        on the fresh-outpaint ring (kills the ~1x/sec edge "snap"). The cover
+        crop already does this top/bottom; overscan makes it symmetric.
         """
         if not target:
             return None
@@ -831,8 +836,10 @@ class ZoomquiltPipeline:
             return (f"scale={w}:{h}:force_original_aspect_ratio=decrease:"
                     f"flags=lanczos,"
                     f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1")
-        # cover: scale up to fill, crop the overflow (default)
-        return (f"scale={w}:{h}:force_original_aspect_ratio=increase:"
+        # cover: scale up to fill (x overscan), then center-crop to target
+        sw = int(round(w * max(1.0, overscan)))
+        sh = int(round(h * max(1.0, overscan)))
+        return (f"scale={sw}:{sh}:force_original_aspect_ratio=increase:"
                 f"flags=lanczos,crop={w}:{h},setsar=1")
 
     def _neural_upscale(self, seq, factor, upscaler):
@@ -951,7 +958,17 @@ class ZoomquiltPipeline:
             factor = max(1, min(4, -(-long_edge // self.gen_res)))  # ceil, cap 4
             seq = self._neural_upscale(seq, factor, upscaler)
 
-        vf = self._scale_filter(target, self.cfg.get("fit", "cover"))
+        # Auto edge-crop: overscan so the visible L/R edges fall inside the
+        # consistent center (radius ~zoom), cropping out the fresh-outpaint ring
+        # that causes the edge "snap". Amount derives from the zoom factor:
+        # show the central (zoom - margin) of the width.
+        overscan = 1.0
+        if self.cfg.get("edge_crop", True) and self.cfg.get("fit") != "fit":
+            z = float(self.cfg.get("zoom", DEFAULT_ZOOM))
+            overscan = 1.0 / max(0.5, min(0.95, z - 0.05))
+            self.log(f"  edge-crop overscan x{overscan:.2f} "
+                     f"(hides the {(1 - 1 / overscan) * 100:.0f}% edge ring)")
+        vf = self._scale_filter(target, self.cfg.get("fit", "cover"), overscan)
         # Motion smoothing: a center-weighted 3-frame temporal blend softens the
         # per-real-frame content "snap" at the edges (a generation discontinuity
         # the tween can't remove) into motion blur. Roughly halves the snap.
@@ -1559,6 +1576,12 @@ class ZoomquiltApp:
         self.smooth_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(vid_row, text="Smooth", variable=self.smooth_var).pack(
             side="left", padx=(12, 0))
+        # Edge-crop: overscan (~1-zoom) so the snappy outpaint ring is cropped
+        # off the L/R edges, like the cover crop already does top/bottom.
+        self.edge_crop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(vid_row, text="Crop edges",
+                        variable=self.edge_crop_var).pack(side="left",
+                                                          padx=(8, 0))
 
         # Start image (optional): seeds frame 0 instead of generating it.
         si_row = ttk.Frame(glob)
@@ -1968,6 +1991,7 @@ class ZoomquiltApp:
             "fps": int(self.fps_var.get()),
             "direction": "in" if self.direction_var.get() == "Zoom In" else "out",
             "smooth": bool(self.smooth_var.get()),
+            "edge_crop": bool(self.edge_crop_var.get()),
             "tween": int(self.tween_var.get()),
             "warp_strength": float(self.warp_var.get()),
             "gen_res": int(self.gen_var.get()),
