@@ -22,6 +22,10 @@ Highlights:
 - **Zoom In / Zoom Out** direction, FPS, Speed, and a live "final resolution / length" readout.
 - **Fast-model controls** — pick the checkpoint, steps, CFG, sampler from the app; one-click ⚡ Fast preset for Turbo/Lightning/Hyper-SD/LCM models.
 - **Backend health poll** — auto-detects when your WebUI is online and auto-loads its styles/upscalers.
+- **Swappable prompt banks** — a `prompts/` folder of themed sets (landscapes, noir, space, trippy, creepy) in a dropdown; the 🎲 dice / Roll All draw from the chosen one. Drop in your own `.txt` and it appears automatically.
+- **Theme generator** — type a theme ("+ New theme…" in the app, or `make-theme.bat`) and it writes a fresh prompt bank using your local Ollama (offline fallback included).
+- **Batch / Infinite** — Bulk-N runs, ∞ Infinite, ⚄ Randomize-prompts-each-run, and a cooldown between runs, for an endless gallery of unique zoomquilts.
+- **Dark themed UI** — collapsible, resizable panels (black / purple / orange).
 - Multi-GPU aware (auto-pins the highest-VRAM card for the ML passes).
 
 ## Requirements
@@ -68,7 +72,10 @@ For fast scenery generation, drop a few-step model (SDXL-Lightning, Hyper-SD, SD
 |------|---------|
 | `zoomquilt3d.py` | The app (single file) |
 | `installer.py` / `install.bat` | Backend installer & launcher |
-| `build_prompt_bank.py` | Regenerates `prompts.txt` (5,000 landscape prompts) |
+| `prompts/` | Prompt banks (`*.txt`, one prompt per line) shown in the dropdown |
+| `build_prompt_bank.py` | Regenerates `prompts/landscapes.txt` (5,000 prompts) |
+| `build_theme_banks.py` | Regenerates the noir/space/trippy/creepy banks |
+| `theme_gen.py` / `make-theme.bat` | Generate a new themed bank from a typed theme (Ollama) |
 | `setup.bat` | Builds the Python 3.11 venv |
 | `launch.bat` | Runs the app |
 

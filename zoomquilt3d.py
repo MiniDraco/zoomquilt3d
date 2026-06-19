@@ -75,15 +75,22 @@ OUTPUT_PRESETS = {
     "Square 2048": (2048, 2048),
 }
 DEFAULT_API = "http://127.0.0.1:7860"
-DEFAULT_ZOOM = 0.7
+DEFAULT_ZOOM = 0.82           # buttery preset: smaller per-frame jump = each
+                              # generated level is a thin new ring, not a fat
+                              # one -> far less level-to-level discontinuity
 DEFAULT_FRAMES = 60
 FRAMES_PAD = 30               # auto-mode: frames of "play" added per keyframe
 SD_STEPS = 20
 SD_DENOISE = 0.75             # seed-frame denoise (frame 0 uses 1.0)
-OUTPAINT_DENOISE = 0.82       # border denoise - high enough to fill, low
-                              # enough to follow the scene's colors
+OUTPAINT_DENOISE = 0.70       # buttery preset: lower border denoise keeps the
+                              # new ring closer to the previous frame's smooth
+                              # continuation (flows) instead of inventing a
+                              # discontinuous border every frame
 MASK_FEATHER = 48             # gaussian blur radius for seamless mask blend
-SEAM_OVERLAP = 40             # px of the pasted edge also repainted (blend ring)
+SEAM_OVERLAP = 16             # px of the pasted edge also repainted (blend ring).
+                              # Smaller = the kept center's boundary is altered
+                              # less by the outpaint, so consecutive zoom levels
+                              # match better at the edges (less edge "snap").
 EMPTY_STD_THRESHOLD = 7.0     # border std-dev below this => "empty/flat" frame
 MAX_FRAME_RETRIES = 2         # re-roll a frame this many times if it comes back empty
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -92,6 +99,22 @@ WARP_STRENGTH = 0.10          # how aggressively foreground expands in Pass 3
 
 PREVIEW_MAX = 460             # preview panel size in px
 HEALTH_INTERVAL_MS = 8000     # backend liveness ping period
+
+# Dark theme palette: black / white / purple / orange.
+PALETTE = {
+    "bg":       "#100d17",    # near-black base (hint of purple)
+    "surface":  "#1a1525",    # panels
+    "surface2": "#241d33",    # inputs / raised
+    "fg":       "#f0ecf6",    # off-white text
+    "muted":    "#9a93ad",    # secondary text
+    "purple":   "#9d5cff",    # primary accent
+    "purple_hi": "#b98cff",
+    "orange":   "#ff8a3d",    # secondary accent / highlights
+    "orange_hi": "#ffab6b",
+    "border":   "#352b4a",
+    "ok":       "#5ad17a",
+    "bad":      "#ff6b6b",
+}
 
 OUT_FRAMES = "frames"
 OUT_DEPTHS = "depths"
@@ -711,26 +734,44 @@ class ZoomquiltPipeline:
             base = base.filter(ImageFilter.UnsharpMask(
                 radius=2, percent=pct, threshold=2))
 
-        # Place `inner` at scale s, ALSO sub-pixel centered with the same affine
-        # convention, so it registers exactly onto the inner content already
-        # baked into `base` -> no double-image (blur) and no shimmer (jitter).
+        # Place `inner` at scale s, sub-pixel centered with the same affine, so
+        # it registers exactly onto the inner content baked into `base`. Use an
+        # RGBA transform with a TRANSPARENT fill and alpha-paste it onto a copy
+        # of base, so outside the inner footprint the layer is `base` (never
+        # black). This removes the need for a square footprint mask.
         s = z ** (1.0 - t)                  # inner footprint fraction (z -> 1)
         invs = 1.0 / s
-        inner_layer = inner.transform(
+        trans = inner.convert("RGBA").transform(
             (g, g), Image.AFFINE,
             (invs, 0.0, c * (1.0 - invs), 0.0, invs, c * (1.0 - invs)),
-            resample=Image.BICUBIC)
+            resample=Image.BICUBIC, fillcolor=(0, 0, 0, 0))
+        inner_layer = base.copy()
+        inner_layer.paste(trans, (0, 0), trans)
 
-        sN = s * g
-        feather = max(2.0, sN * 0.05)
-        half = max(1.0, sN / 2.0 - feather)   # keep blurred mask on valid inner
-        mask = Image.new("L", (g, g), 0)
-        ImageDraw.Draw(mask).rectangle(
-            [c - half, c - half, c + half, c + half], fill=255)
-        mask = mask.filter(ImageFilter.GaussianBlur(feather))
+        # Blend the sharp inner over base with a CENTERED RADIAL mask that fades
+        # to zero well before the frame edge. The old square footprint mask had
+        # vertical sides that swept outward to the edges each cycle then reset
+        # at the real frame -> the edges "toggled" between layers ~1x/sec. With
+        # a radial mask the edges are ALWAYS the smooth base zoom (no seam),
+        # while the center still gets the sharp inner detail.
         alpha = int(round(t * 255))        # temporal crossfade weight
-        mask = mask.point(lambda p: p * alpha // 255)
+        mask = self._radial_blend_mask().point(lambda v: v * alpha // 255)
         return Image.composite(inner_layer, base, mask)
+
+    def _radial_blend_mask(self):
+        """Cached centered radial alpha (full center -> 0 by ~0.72 radius)."""
+        cached = getattr(self, "_rad_mask", None)
+        if cached is not None and cached.size[0] == self.gen_res:
+            return cached
+        g = self.gen_res
+        yy, xx = np.mgrid[0:g, 0:g].astype(np.float32)
+        cc = (g - 1) / 2.0
+        r = np.sqrt(((xx - cc) / (g / 2.0)) ** 2 +
+                    ((yy - cc) / (g / 2.0)) ** 2)
+        inner_r, outer_r = 0.45, 0.72      # 1.0 == mid-edge; stays off corners
+        a = np.clip((outer_r - r) / (outer_r - inner_r), 0.0, 1.0)
+        self._rad_mask = Image.fromarray((a * 255).astype(np.uint8), "L")
+        return self._rad_mask
 
     def _make_tweens(self, ordered_paths, count):
         """
@@ -911,6 +952,12 @@ class ZoomquiltPipeline:
             seq = self._neural_upscale(seq, factor, upscaler)
 
         vf = self._scale_filter(target, self.cfg.get("fit", "cover"))
+        # Motion smoothing: a center-weighted 3-frame temporal blend softens the
+        # per-real-frame content "snap" at the edges (a generation discontinuity
+        # the tween can't remove) into motion blur. Roughly halves the snap.
+        if self.cfg.get("smooth"):
+            tmix = "tmix=frames=3:weights=1 2 1"
+            vf = f"{tmix},{vf}" if vf else tmix
         # Save each render with a timestamped name in a persistent 'renders'
         # dir (sibling of output/) that is NEVER cleared between runs, so a
         # new generation can't purge previous videos.
@@ -1005,6 +1052,116 @@ class ZoomquiltPipeline:
 # ===========================================================================
 #  GUI
 # ===========================================================================
+def apply_theme(root):
+    """Dark black/white/purple/orange theme for all ttk + tk widgets."""
+    p = PALETTE
+    root.configure(bg=p["bg"])
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    style.configure(".", background=p["bg"], foreground=p["fg"],
+                    fieldbackground=p["surface2"], bordercolor=p["border"],
+                    lightcolor=p["surface2"], darkcolor=p["bg"],
+                    troughcolor=p["surface2"], focuscolor=p["purple"],
+                    font=("Segoe UI", 9))
+    style.configure("TFrame", background=p["bg"])
+    style.configure("TLabel", background=p["bg"], foreground=p["fg"])
+    style.configure("TLabelframe", background=p["bg"], bordercolor=p["border"])
+    style.configure("TLabelframe.Label", background=p["bg"],
+                    foreground=p["purple_hi"])
+
+    style.configure("TButton", background=p["purple"], foreground="white",
+                    bordercolor=p["purple"], focuscolor=p["bg"],
+                    padding=(8, 3), relief="flat")
+    style.map("TButton",
+              background=[("pressed", p["orange"]), ("active", p["orange_hi"])],
+              foreground=[("disabled", p["muted"])])
+
+    # Big primary action button (Generate)
+    style.configure("Accent.TButton", background=p["orange"], foreground="white",
+                    padding=(10, 6), font=("Segoe UI", 10, "bold"))
+    style.map("Accent.TButton",
+              background=[("pressed", p["purple"]), ("active", p["orange_hi"])])
+
+    # Collapsible-section header button
+    style.configure("Section.TButton", background=p["surface2"],
+                    foreground=p["orange"], anchor="w", padding=(8, 5),
+                    font=("Segoe UI", 10, "bold"), relief="flat")
+    style.map("Section.TButton",
+              background=[("active", p["surface"]), ("pressed", p["surface"])],
+              foreground=[("active", p["orange_hi"])])
+
+    for w in ("TEntry", "TSpinbox", "TCombobox"):
+        style.configure(w, fieldbackground=p["surface2"], foreground=p["fg"],
+                        insertcolor=p["fg"], arrowcolor=p["purple_hi"],
+                        bordercolor=p["border"], padding=2)
+    style.map("TCombobox", fieldbackground=[("readonly", p["surface2"])],
+              foreground=[("readonly", p["fg"])])
+    style.map("TSpinbox", fieldbackground=[("readonly", p["surface2"])])
+
+    style.configure("TCheckbutton", background=p["bg"], foreground=p["fg"],
+                    indicatorcolor=p["surface2"])
+    style.map("TCheckbutton",
+              indicatorcolor=[("selected", p["purple"])],
+              foreground=[("active", p["orange_hi"])])
+
+    style.configure("TScale", background=p["bg"], troughcolor=p["surface2"])
+    style.configure("Horizontal.TProgressbar", background=p["orange"],
+                    troughcolor=p["surface2"], bordercolor=p["border"])
+    style.configure("TScrollbar", background=p["surface2"],
+                    troughcolor=p["bg"], arrowcolor=p["purple_hi"],
+                    bordercolor=p["border"])
+    style.configure("TPanedwindow", background=p["bg"])
+    style.configure("Sash", sashthickness=6, gripcount=0)
+
+    # tk (non-ttk) widget defaults via the option DB.
+    root.option_add("*Listbox.background", p["surface2"])
+    root.option_add("*Listbox.foreground", p["fg"])
+    root.option_add("*Listbox.selectBackground", p["purple"])
+    root.option_add("*Listbox.selectForeground", "white")
+    root.option_add("*Listbox.highlightThickness", 0)
+    root.option_add("*Text.background", p["surface"])
+    root.option_add("*Text.foreground", p["fg"])
+    root.option_add("*Text.insertBackground", p["orange"])
+    root.option_add("*Text.highlightThickness", 0)
+
+
+class CollapsibleSection(ttk.Frame):
+    """A titled section whose body collapses/expands when the header is clicked.
+
+    Pack widgets into `.body`. Pack the section itself like any frame; pass
+    `fill='both', expand=True` for the section that should grow.
+    """
+
+    def __init__(self, parent, title, expanded=True):
+        super().__init__(parent)
+        self._title = title
+        self.expanded = tk.BooleanVar(value=expanded)
+        self.header = ttk.Button(self, style="Section.TButton",
+                                 command=self.toggle, takefocus=False)
+        self.header.pack(fill="x")
+        self.body = ttk.Frame(self, padding=(8, 6))
+        if expanded:
+            self.body.pack(fill="both", expand=True)
+        self._render()
+
+    def _render(self):
+        arrow = "▾" if self.expanded.get() else "▸"   # ▾ / ▸
+        self.header.config(text=f"  {arrow}  {self._title}")
+
+    def toggle(self):
+        if self.expanded.get():
+            self.body.forget()
+            self.expanded.set(False)
+        else:
+            self.body.pack(fill="both", expand=True)
+            self.expanded.set(True)
+        self._render()
+
+
 class KeyframeRow:
     """One timeline layer: frame index, prompt text, delete button."""
 
@@ -1030,7 +1187,10 @@ class KeyframeRow:
         # emoji die (U+1F3B2) renders as a tofu box in Tk on Windows.
         self.dice_btn = tk.Button(self.frame, text="⚄", width=2,
                                   font=("Segoe UI Symbol", 11),
-                                  command=self.roll)
+                                  command=self.roll, relief="flat",
+                                  bg=PALETTE["purple"], fg="white",
+                                  activebackground=PALETTE["orange"],
+                                  activeforeground="white", bd=0)
         self.dice_btn.pack(side="left", padx=(0, 4))
 
         self.del_btn = ttk.Button(self.frame, text="Delete", width=7,
@@ -1066,7 +1226,15 @@ class ZoomquiltApp:
         self.rows = []
         self._preview_ref = None      # keep PhotoImage alive
         self._suppress_total = False  # guard auto<->manual feedback loop
-        self.prompt_bank = self._load_prompt_bank()
+        self._batch_remaining = 0     # batch / infinite generation state
+        self._batch_infinite = False
+        self._batch_stopped = False
+        self._batch_index = 0
+        self._batch_done = 0
+        self.prompt_sets = self._scan_prompt_sets()
+        self._active_set = ("landscapes" if "landscapes" in self.prompt_sets
+                            else next(iter(self.prompt_sets), ""))
+        self.prompt_bank = self._load_prompt_set(self._active_set)
 
         self._build_ui()
         # Seed with a mandatory Frame 0 row + one downstream keyframe.
@@ -1083,26 +1251,51 @@ class ZoomquiltApp:
         self.root.after(600, self._health_poll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ----- prompt bank -----------------------------------------------------
-    def _load_prompt_bank(self):
-        """Load prompts.txt (one prompt per line) sitting next to this script."""
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "prompts.txt")
+    # ----- prompt sets (a folder of swappable .txt banks) ------------------
+    def _prompts_dir(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "prompts")
+
+    def _scan_prompt_sets(self):
+        """Return {display name: path} for every .txt in the prompts/ folder.
+        Drop your own one-prompt-per-line .txt files in there and they show up
+        in the dropdown automatically."""
+        d = self._prompts_dir()
+        os.makedirs(d, exist_ok=True)
+        # Migrate a legacy root-level prompts.txt into the folder.
+        legacy = os.path.join(os.path.dirname(d), "prompts.txt")
+        landscapes = os.path.join(d, "landscapes.txt")
+        if os.path.isfile(legacy) and not os.path.isfile(landscapes):
+            try:
+                os.replace(legacy, landscapes)
+            except OSError:
+                pass
+        sets = {}
+        for fn in sorted(os.listdir(d)):
+            if fn.lower().endswith(".txt"):
+                sets[os.path.splitext(fn)[0]] = os.path.join(d, fn)
+        return sets
+
+    def _load_prompt_set(self, name):
+        """Load one set's prompts (one per line)."""
+        path = self.prompt_sets.get(name)
+        if not path:
+            return []
         try:
             with open(path, encoding="utf-8") as f:
-                bank = [ln.strip() for ln in f if ln.strip()]
-            return bank
+                return [ln.strip() for ln in f if ln.strip()]
         except OSError:
             return []
 
     def random_prompt(self):
-        """Return one random prompt from the bank, or None if empty."""
+        """Return one random prompt from the active set, or None if empty."""
         import random as _random
         if not self.prompt_bank:
             messagebox.showwarning(
-                "No prompt bank",
-                "prompts.txt not found. Run build_prompt_bank.py to "
-                "generate the 5000-prompt landscape bank.")
+                "No prompts",
+                "The selected prompt set is empty. Add a one-prompt-per-line "
+                ".txt file to the 'prompts' folder (or run "
+                "build_prompt_bank.py for the 5000-prompt landscape set).")
             return None
         return _random.choice(self.prompt_bank)
 
@@ -1110,6 +1303,71 @@ class ZoomquiltApp:
         """Fill every keyframe row with a fresh random prompt."""
         for row in self.rows:
             row.roll()
+
+    def _refresh_sets(self):
+        """Re-scan prompts/ when the dropdown opens (picks up new files)."""
+        self.prompt_sets = self._scan_prompt_sets()
+        self.set_combo.config(values=list(self.prompt_sets))
+
+    def _on_set_selected(self):
+        """Switch the active prompt set; Roll All / dice now draw from it."""
+        name = self.set_var.get()
+        self._active_set = name
+        self.prompt_bank = self._load_prompt_set(name)
+        self.bank_lbl.config(text=f"{len(self.prompt_bank)} prompts")
+
+    def new_theme(self):
+        """Prompt for a theme and run theme_gen.py to build a new bank."""
+        import subprocess
+        from tkinter import simpledialog
+        theme = simpledialog.askstring(
+            "New theme",
+            "Theme for the prompt bank (e.g. cyberpunk megacity):",
+            parent=self.root)
+        if not theme or not theme.strip():
+            return
+        theme = theme.strip()
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, "theme_gen.py")
+        if not os.path.isfile(script):
+            messagebox.showerror("Missing", "theme_gen.py not found.")
+            return
+        self.newtheme_btn.config(state="disabled")
+        self.bank_lbl.config(text="generating...")
+        self._log(f"Generating theme bank '{theme}' (uses local Ollama if "
+                  "running, else offline)...")
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    [sys.executable, script, theme],
+                    capture_output=True, text=True, timeout=1800, cwd=here)
+                out = (proc.stdout or "") + (proc.stderr or "")
+            except Exception as e:
+                out = f"ERROR: {e}"
+            try:
+                self.root.after(0, lambda: self._on_theme_done(theme, out))
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_theme_done(self, theme, out):
+        import re
+        for line in out.strip().splitlines()[-3:]:
+            self._log("  " + line)
+        self.newtheme_btn.config(state="normal")
+        self._refresh_sets()
+        slug = re.sub(r"[^a-z0-9]+", "-", theme.lower()).strip("-")
+        if slug in self.prompt_sets:
+            self.set_var.set(slug)
+            self._on_set_selected()           # also updates bank_lbl
+            self._log(f"Theme '{slug}' ready ({len(self.prompt_bank)} "
+                      "prompts) - selected. Click Roll All to use it.")
+        else:
+            self.bank_lbl.config(text=f"{len(self.prompt_bank)} prompts")
+            self._log("Theme generation finished but no file appeared - "
+                      "check the log above.")
 
     def _fast_preset(self):
         """Dial in few-step settings for Turbo/Lightning/Hyper-SD/LCM models."""
@@ -1160,16 +1418,18 @@ class ZoomquiltApp:
 
     # ----- UI construction -------------------------------------------------
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=8)
-        main.pack(fill="both", expand=True)
+        # Resizable horizontal split: drag the sash between controls + preview.
+        main = ttk.PanedWindow(self.root, orient="horizontal")
+        main.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # ---- LEFT: control panel ----
+        # ---- LEFT: control panel (resizable pane) ----
         left = ttk.Frame(main)
-        left.pack(side="left", fill="both", expand=True)
+        main.add(left, weight=3)
 
-        # Global controls
-        glob = ttk.LabelFrame(left, text="Global Settings", padding=8)
-        glob.pack(fill="x", pady=(0, 8))
+        # Global controls (collapsible)
+        glob_sec = CollapsibleSection(left, "Global Settings")
+        glob_sec.pack(fill="x", pady=(0, 6))
+        glob = glob_sec.body
 
         api_row = ttk.Frame(glob)
         api_row.pack(fill="x", pady=2)
@@ -1295,6 +1555,10 @@ class ZoomquiltApp:
         self.warp_var = tk.DoubleVar(value=WARP_STRENGTH)
         ttk.Spinbox(vid_row, from_=0.0, to=0.30, increment=0.02, width=5,
                     format="%.2f", textvariable=self.warp_var).pack(side="left")
+        # Motion smooth: temporal blend that softens the edge "snap" into blur.
+        self.smooth_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(vid_row, text="Smooth", variable=self.smooth_var).pack(
+            side="left", padx=(12, 0))
 
         # Start image (optional): seeds frame 0 instead of generating it.
         si_row = ttk.Frame(glob)
@@ -1340,9 +1604,10 @@ class ZoomquiltApp:
             v.trace_add("write", lambda *a: self._update_final_label())
         self._update_final_label()
 
-        # ---- Forge Styles (sniffed from the API) ----
-        st = ttk.LabelFrame(left, text="Forge Styles", padding=6)
-        st.pack(fill="x", pady=(0, 8))
+        # ---- Forge Styles (sniffed from the API) - collapsed by default ----
+        st_sec = CollapsibleSection(left, "Forge Styles", expanded=False)
+        st_sec.pack(fill="x", pady=(0, 6))
+        st = st_sec.body
 
         st_bar = ttk.Frame(st)
         st_bar.pack(fill="x")
@@ -1368,9 +1633,10 @@ class ZoomquiltApp:
                            "every frame.", foreground="gray").pack(
             anchor="w", pady=(2, 0))
 
-        # ---- Timeline Layer Manager ----
-        tl = ttk.LabelFrame(left, text="Timeline Layer Manager", padding=6)
-        tl.pack(fill="both", expand=True, pady=(0, 8))
+        # ---- Timeline Layer Manager (collapsible, grows to fill space) ----
+        tl_sec = CollapsibleSection(left, "Timeline Layer Manager")
+        tl_sec.pack(fill="both", expand=True, pady=(0, 6))
+        tl = tl_sec.body
 
         tl_bar = ttk.Frame(tl)
         tl_bar.pack(fill="x", pady=(0, 4))
@@ -1385,12 +1651,29 @@ class ZoomquiltApp:
                     textvariable=self.interval_var,
                     command=self._recompute_total).pack(side="left")
         ttk.Label(tl_bar, text="frames").pack(side="left", padx=(2, 0))
-        ttk.Label(tl_bar,
-                  text=f"{len(self.prompt_bank)} prompts in bank").pack(
-            side="right")
+
+        # Prompt-set picker: scans prompts/*.txt; drop your own .txt in there.
+        set_box = ttk.Frame(tl_bar)
+        set_box.pack(side="right")
+        ttk.Label(set_box, text="Prompt set:").pack(side="left")
+        self.set_var = tk.StringVar(value=self._active_set)
+        self.set_combo = ttk.Combobox(set_box, width=16, state="readonly",
+                                      textvariable=self.set_var,
+                                      values=list(self.prompt_sets),
+                                      postcommand=self._refresh_sets)
+        self.set_combo.pack(side="left", padx=(4, 4))
+        self.set_combo.bind("<<ComboboxSelected>>",
+                            lambda e: self._on_set_selected())
+        self.newtheme_btn = ttk.Button(set_box, text="+ New theme…", width=12,
+                                       command=self.new_theme)
+        self.newtheme_btn.pack(side="left", padx=(0, 6))
+        self.bank_lbl = ttk.Label(set_box, foreground=PALETTE["muted"],
+                                  text=f"{len(self.prompt_bank)} prompts")
+        self.bank_lbl.pack(side="left")
 
         # Scrollable region for keyframe rows
-        canvas = tk.Canvas(tl, highlightthickness=0, height=200)
+        canvas = tk.Canvas(tl, highlightthickness=0, height=160,
+                           bg=PALETTE["bg"])
         scrollbar = ttk.Scrollbar(tl, orient="vertical", command=canvas.yview)
         self.rows_container = ttk.Frame(canvas)
         self.rows_container.bind(
@@ -1401,10 +1684,32 @@ class ZoomquiltApp:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # ---- Action buttons + progress ----
+        # ---- Batch controls ----
+        batch = ttk.Frame(left)
+        batch.pack(fill="x", pady=(2, 0))
+        ttk.Label(batch, text="Bulk:").pack(side="left")
+        self.bulk_var = tk.IntVar(value=1)
+        ttk.Spinbox(batch, from_=1, to=999, width=5,
+                    textvariable=self.bulk_var).pack(side="left", padx=(2, 10))
+        self.randomize_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(batch, text="⚄ Randomize prompts each run",
+                        variable=self.randomize_var).pack(side="left")
+        self.infinite_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(batch, text="∞ Infinite (until Stop)",
+                        variable=self.infinite_var).pack(side="left",
+                                                         padx=(10, 0))
+        ttk.Label(batch, text="Cooldown:").pack(side="left", padx=(10, 2))
+        self.delay_var = tk.IntVar(value=0)
+        ttk.Spinbox(batch, from_=0, to=600, width=4,
+                    textvariable=self.delay_var).pack(side="left")
+        ttk.Label(batch, text="s", foreground=PALETTE["muted"]).pack(
+            side="left", padx=(1, 0))
+
+        # ---- Action buttons + progress (always visible) ----
         act = ttk.Frame(left)
-        act.pack(fill="x", pady=(0, 6))
+        act.pack(fill="x", pady=(2, 6))
         self.gen_btn = ttk.Button(act, text="GENERATE ZOOMQUILT",
+                                  style="Accent.TButton",
                                   command=self.start_generation)
         self.gen_btn.pack(side="left", fill="x", expand=True)
         self.stop_btn = ttk.Button(act, text="Stop", width=8,
@@ -1414,26 +1719,35 @@ class ZoomquiltApp:
 
         self.progress = ttk.Progressbar(left, mode="determinate", maximum=100)
         self.progress.pack(fill="x")
-        self.status_lbl = ttk.Label(left, text="Idle.", anchor="w")
+        self.status_lbl = ttk.Label(left, text="Idle.", anchor="w",
+                                    foreground=PALETTE["muted"])
         self.status_lbl.pack(fill="x", pady=(2, 4))
 
-        # ---- Log box ----
-        self.logbox = scrolledtext.ScrolledText(left, height=8, wrap="word",
+        # ---- Log (collapsible) ----
+        log_sec = CollapsibleSection(left, "Log")
+        log_sec.pack(fill="x", pady=(0, 0))
+        self.logbox = scrolledtext.ScrolledText(log_sec.body, height=7,
+                                                wrap="word", relief="flat",
                                                 font=("Consolas", 8))
-        self.logbox.pack(fill="both", expand=False)
+        self.logbox.pack(fill="both", expand=True)
 
-        # ---- RIGHT: preview panel ----
-        right = ttk.LabelFrame(main, text="Live Preview", padding=8)
-        right.pack(side="right", fill="both", padx=(8, 0))
+        # ---- RIGHT: preview panel (resizable pane) ----
+        right = ttk.Frame(main, padding=(8, 0, 0, 0))
+        main.add(right, weight=2)
+        ttk.Label(right, text="Live Preview",
+                  foreground=PALETTE["purple_hi"],
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
         self.preview_canvas = tk.Canvas(right, width=PREVIEW_MAX,
-                                        height=PREVIEW_MAX, bg="#101014",
+                                        height=PREVIEW_MAX, bg=PALETTE["bg"],
                                         highlightthickness=1,
-                                        highlightbackground="#333")
-        self.preview_canvas.pack()
-        self.preview_canvas.create_text(
-            PREVIEW_MAX // 2, PREVIEW_MAX // 2,
-            text="preview", fill="#444", font=("Segoe UI", 14),
-            tags="placeholder")
+                                        highlightbackground=PALETTE["border"])
+        self.preview_canvas.pack(fill="both", expand=True, pady=(4, 0))
+        self.preview_canvas.bind(
+            "<Configure>",
+            lambda e: self._draw_placeholder() if self._preview_ref is None
+            else self._show_preview(self._preview_pil))
+        self._preview_pil = None
+        self._draw_placeholder()
 
     # ----- row management --------------------------------------------------
     def _row_indices(self):
@@ -1653,6 +1967,7 @@ class ZoomquiltApp:
             "stitch": bool(self.stitch_var.get()),
             "fps": int(self.fps_var.get()),
             "direction": "in" if self.direction_var.get() == "Zoom In" else "out",
+            "smooth": bool(self.smooth_var.get()),
             "tween": int(self.tween_var.get()),
             "warp_strength": float(self.warp_var.get()),
             "gen_res": int(self.gen_var.get()),
@@ -1675,28 +1990,79 @@ class ZoomquiltApp:
     def start_generation(self):
         if self.worker and self.worker.is_alive():
             return
+        # Set up the batch: a count, or unlimited if Infinite is ticked.
+        self._batch_stopped = False
+        self._batch_infinite = bool(self.infinite_var.get())
+        try:
+            count = max(1, int(self.bulk_var.get()))
+        except (ValueError, tk.TclError):
+            count = 1
+        self._batch_remaining = count
+        self._batch_index = 0
+        self._batch_done = 0
+        self.gen_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        if self._batch_infinite:
+            self._log("=== INFINITE batch started (Stop to end) ===")
+        elif count > 1:
+            self._log(f"=== BULK batch of {count} started ===")
+        self._start_one_run()
+
+    def _start_one_run(self):
+        """Start a single generation within the batch (Tk main thread)."""
+        if self._batch_stopped:
+            return self._finish_batch()
+        # Optionally re-roll all keyframe prompts for fresh scenery this run.
+        if self.randomize_var.get():
+            self.roll_all()
         try:
             cfg = self._collect_config()
         except ValueError as e:
             messagebox.showerror("Invalid configuration", str(e))
-            return
+            return self._finish_batch()
 
+        self._batch_index += 1
         self.cancel_flag.clear()
         self.progress.config(value=0)
         self.logbox.delete("1.0", "end")
-        self.gen_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self._log(f"=== Run started {datetime.now():%H:%M:%S} ===")
+        tag = ""
+        if self._batch_infinite:
+            tag = f" (run {self._batch_index}, infinite)"
+        elif self._batch_remaining > 1 or self._batch_index > 1:
+            tag = f" (run {self._batch_index}/{self._batch_index + self._batch_remaining - 1})"
+        self._log(f"=== Run started {datetime.now():%H:%M:%S}{tag} ===")
         self._log(f"Keyframes: {sorted(cfg['keyframes'])}")
 
         pipeline = ZoomquiltPipeline(cfg, self.events, self.cancel_flag)
         self.worker = threading.Thread(target=pipeline.run, daemon=True)
         self.worker.start()
 
+    def _cooldown(self, secs):
+        """Wait `secs` (live countdown) then start the next batch run."""
+        if self._batch_stopped:
+            return self._finish_batch()
+        if secs <= 0:
+            return self.root.after(700, self._start_one_run)   # small settle
+        self.status_lbl.config(text=f"Cooldown {secs}s before next run...")
+        self.root.after(1000, lambda: self._cooldown(secs - 1))
+
+    def _finish_batch(self):
+        self.gen_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        msg = f"Batch complete - {self._batch_done} render(s) saved."
+        self.status_lbl.config(text=msg)
+        if self._batch_done > 1 or self._batch_infinite:
+            self._log("=== " + msg + " ===")
+
     def stop_generation(self):
+        self._batch_stopped = True
+        self._batch_infinite = False
+        self._batch_remaining = 0
         if self.worker and self.worker.is_alive():
             self.cancel_flag.set()
             self.status_lbl.config(text="Stopping after current step...")
+        else:
+            self._finish_batch()
 
     # ----- event pump (runs on Tk main thread) ----------------------------
     def _drain_events(self):
@@ -1719,24 +2085,54 @@ class ZoomquiltApp:
         self.root.after(80, self._drain_events)
 
     def _on_done(self, ok, msg):
-        self.gen_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
         self.status_lbl.config(text=msg)
         self._log("=== " + ("DONE: " if ok else "ENDED: ") + msg + " ===")
         if ok:
-            messagebox.showinfo("Zoomquilt complete", msg)
+            self._batch_done += 1
+        self._batch_remaining -= 1
+        # Continue the batch only on success and if not stopped.
+        more = (not self._batch_stopped) and ok and \
+               (self._batch_infinite or self._batch_remaining > 0)
+        if more:
+            try:
+                delay = max(0, int(self.delay_var.get()))
+            except (ValueError, tk.TclError):
+                delay = 0
+            self._cooldown(delay)
+        else:
+            self._finish_batch()
+            # Single, non-batch run: keep the original completion popup.
+            if ok and self._batch_done == 1 and not self._batch_infinite:
+                messagebox.showinfo("Zoomquilt complete", msg)
 
     def _log(self, msg):
         self.logbox.insert("end", msg + "\n")
         self.logbox.see("end")
 
+    def _canvas_size(self):
+        w = self.preview_canvas.winfo_width()
+        h = self.preview_canvas.winfo_height()
+        if w < 10 or h < 10:                 # not laid out yet
+            w = h = PREVIEW_MAX
+        return w, h
+
+    def _draw_placeholder(self):
+        self.preview_canvas.delete("all")
+        w, h = self._canvas_size()
+        self.preview_canvas.create_text(
+            w // 2, h // 2, text="preview", fill=PALETTE["muted"],
+            font=("Segoe UI", 14), tags="placeholder")
+
     def _show_preview(self, pil_image):
+        # Fit to the (resizable) canvas while keeping aspect; recenter.
+        self._preview_pil = pil_image
+        w, h = self._canvas_size()
         img = pil_image.copy()
-        img.thumbnail((PREVIEW_MAX, PREVIEW_MAX), Image.LANCZOS)
+        img.thumbnail((max(16, w - 4), max(16, h - 4)), Image.LANCZOS)
         self._preview_ref = ImageTk.PhotoImage(img)
         self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(
-            PREVIEW_MAX // 2, PREVIEW_MAX // 2, image=self._preview_ref)
+        self.preview_canvas.create_image(w // 2, h // 2,
+                                         image=self._preview_ref)
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():
@@ -1744,6 +2140,8 @@ class ZoomquiltApp:
                                        "A run is in progress. Stop and quit?"):
                 return
             self.cancel_flag.set()
+        self._batch_stopped = True
+        self._batch_infinite = False
         self._poll_running = False
         self.root.destroy()
 
@@ -1754,10 +2152,7 @@ def main():
         print("FATAL: numpy is required.  pip install numpy", file=sys.stderr)
         return
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("clam")
-    except tk.TclError:
-        pass
+    apply_theme(root)
     ZoomquiltApp(root)
     root.mainloop()
 

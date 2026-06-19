@@ -221,7 +221,9 @@ def build():
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    out = os.path.join(here, "prompts.txt")
+    out_dir = os.path.join(here, "prompts")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "landscapes.txt")
     prompts = build()
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(prompts) + "\n")
