@@ -1,0 +1,10 @@
+# 3D AI Zoomquilt Engine - Python dependencies
+# Install into the venv created by setup.bat (Python 3.11).
+#
+# torch is installed SEPARATELY by setup.bat from the CUDA wheel index
+# (cu121) so it gets GPU support. Do not pin torch here.
+
+requests>=2.31
+pillow>=10.0
+numpy>=1.24
+transformers>=4.40
