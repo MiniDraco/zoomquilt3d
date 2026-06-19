@@ -717,8 +717,8 @@ class ZoomquiltPipeline:
         the center - registered so the inner content sits exactly where it is
         baked into `outer`. Pure resampling: no model, milliseconds per frame.
         """
-        g = self.gen_res
-        c = (g - 1) / 2.0                   # exact pixel center
+        g = outer.width                     # adapt to the frame size (so we can
+        c = (g - 1) / 2.0                   # tween AFTER upscaling, at high res)
         m = z ** (-t)                       # screen magnification 1 -> 1/z
 
         # Zoom `outer` in by m about the EXACT center via a sub-pixel affine
@@ -755,23 +755,24 @@ class ZoomquiltPipeline:
         # a radial mask the edges are ALWAYS the smooth base zoom (no seam),
         # while the center still gets the sharp inner detail.
         alpha = int(round(t * 255))        # temporal crossfade weight
-        mask = self._radial_blend_mask().point(lambda v: v * alpha // 255)
+        mask = self._radial_blend_mask(g).point(lambda v: v * alpha // 255)
         return Image.composite(inner_layer, base, mask)
 
-    def _radial_blend_mask(self):
+    def _radial_blend_mask(self, g):
         """Cached centered radial alpha (full center -> 0 by ~0.72 radius)."""
-        cached = getattr(self, "_rad_mask", None)
-        if cached is not None and cached.size[0] == self.gen_res:
-            return cached
-        g = self.gen_res
+        cache = getattr(self, "_rad_mask_cache", None)
+        if cache is None:
+            cache = self._rad_mask_cache = {}
+        if g in cache:
+            return cache[g]
         yy, xx = np.mgrid[0:g, 0:g].astype(np.float32)
         cc = (g - 1) / 2.0
         r = np.sqrt(((xx - cc) / (g / 2.0)) ** 2 +
                     ((yy - cc) / (g / 2.0)) ** 2)
         inner_r, outer_r = 0.45, 0.72      # 1.0 == mid-edge; stays off corners
         a = np.clip((outer_r - r) / (outer_r - inner_r), 0.0, 1.0)
-        self._rad_mask = Image.fromarray((a * 255).astype(np.uint8), "L")
-        return self._rad_mask
+        cache[g] = Image.fromarray((a * 255).astype(np.uint8), "L")
+        return cache[g]
 
     def _make_tweens(self, ordered_paths, count):
         """
@@ -936,19 +937,6 @@ class ZoomquiltPipeline:
         zoomin_paths = [os.path.join(warps_dir, fn)
                         for fn in reversed(frame_files)]
 
-        if eff_tween > 0:
-            self.log(f"PASS 4a  -  tweening x{eff_tween} (smoothing, no SD)")
-            seq = self._make_tweens(zoomin_paths, eff_tween)
-        else:
-            seq = zoomin_paths
-        if subsample > 1:
-            seq = seq[::subsample]
-
-        # Direction just chooses playback order of the (already tweened) seq.
-        zoom_in = self.cfg.get("direction", "in") == "in"
-        if not zoom_in:                       # zoom OUT = play inner -> outer
-            seq = list(reversed(seq))
-
         target = OUTPUT_PRESETS.get(self.cfg.get("out_res"), None)
 
         # Auto edge-crop: overscan so the visible L/R edges fall inside the
@@ -962,14 +950,31 @@ class ZoomquiltPipeline:
             self.log(f"  edge-crop overscan x{overscan:.2f} "
                      f"(hides the {(1 - 1 / overscan) * 100:.0f}% edge ring)")
 
-        # Optional neural upscale. Crucially, account for the overscan: enlarge
-        # to target x overscan so that AFTER the crop the visible region is
-        # still at full target resolution (real detail), not a magnified blur.
+        # Neural upscale the REAL frames BEFORE tweening, not the whole tweened
+        # sequence. The tweens are free resamples of these frames, so upscaling
+        # them too is hugely wasteful (e.g. 976 frames vs ~97 real ones). We
+        # upscale the few real frames with detail, then tween at high res - the
+        # tweens inherit the detail. ~10x fewer neural calls.
         upscaler = self.cfg.get("upscaler", "")
         if upscaler and upscaler.lower() not in ("", "lanczos", "none"):
             long_edge = (max(target) if target else self.gen_res) * overscan
             factor = max(1, min(4, -(-int(long_edge) // self.gen_res)))  # ceil
-            seq = self._neural_upscale(seq, factor, upscaler)
+            self.log(f"PASS 4b  -  neural upscale {len(zoomin_paths)} real "
+                     f"frames x{factor} (then tween at high res)")
+            zoomin_paths = self._neural_upscale(zoomin_paths, factor, upscaler)
+
+        if eff_tween > 0:
+            self.log(f"PASS 4a  -  tweening x{eff_tween} (smoothing, no SD)")
+            seq = self._make_tweens(zoomin_paths, eff_tween)
+        else:
+            seq = zoomin_paths
+        if subsample > 1:
+            seq = seq[::subsample]
+
+        # Direction just chooses playback order of the (already tweened) seq.
+        zoom_in = self.cfg.get("direction", "in") == "in"
+        if not zoom_in:                       # zoom OUT = play inner -> outer
+            seq = list(reversed(seq))
 
         vf = self._scale_filter(target, self.cfg.get("fit", "cover"), overscan)
         # Motion smoothing: a center-weighted 3-frame temporal blend softens the
