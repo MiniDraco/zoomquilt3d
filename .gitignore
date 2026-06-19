@@ -1,35 +1,58 @@
-# Python venv (machine-specific, multi-GB torch)
+# deps / envs
+node_modules/
+.next/
 .venv/
 venv/
 env/
-
-# Byte-compiled
+ENV/
 __pycache__/
-*.py[cod]
-*.egg-info/
-
-# Generated pipeline output (working dirs - regenerated each run)
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+# build outputs
+dist/
+build/
+out/
+outputs/
 output/
-renders/
-
-# Installed backends (git-cloned by installer.py, multi-GB)
-backends/
-
-# Model weights
+.cache/
+*.tsbuildinfo
+# models / weights
+models/
+model/
+weights/
+checkpoints/
+*.gguf
+*.onnx
 *.safetensors
 *.ckpt
 *.pt
 *.pth
-*.gguf
-
-# OS / editor
-Thumbs.db
-.DS_Store
-.idea/
-.vscode/
+*.bin
+*.pkl
+# large binaries / archives / media
+*.exe
+*.dll
+*.so
+*.dylib
+*.7z
+*.zip
+*.rar
+*.tar
+*.gz
+*.apk
+*.webm
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.flac
+# secrets / local
+.env
+.env.*
+*.local
 *.log
-
-# analysis / scratch
-_*/
-_*.png
-scratch_*/
+.DS_Store
+Thumbs.db
