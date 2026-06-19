@@ -949,14 +949,7 @@ class ZoomquiltPipeline:
         if not zoom_in:                       # zoom OUT = play inner -> outer
             seq = list(reversed(seq))
 
-        # Resolve the output target + optional neural upscale.
         target = OUTPUT_PRESETS.get(self.cfg.get("out_res"), None)
-        upscaler = self.cfg.get("upscaler", "")
-        if upscaler and upscaler.lower() not in ("", "lanczos", "none"):
-            # enlarge enough to cover the target's long edge with detail
-            long_edge = max(target) if target else self.gen_res
-            factor = max(1, min(4, -(-long_edge // self.gen_res)))  # ceil, cap 4
-            seq = self._neural_upscale(seq, factor, upscaler)
 
         # Auto edge-crop: overscan so the visible L/R edges fall inside the
         # consistent center (radius ~zoom), cropping out the fresh-outpaint ring
@@ -968,6 +961,16 @@ class ZoomquiltPipeline:
             overscan = 1.0 / max(0.5, min(0.95, z - 0.05))
             self.log(f"  edge-crop overscan x{overscan:.2f} "
                      f"(hides the {(1 - 1 / overscan) * 100:.0f}% edge ring)")
+
+        # Optional neural upscale. Crucially, account for the overscan: enlarge
+        # to target x overscan so that AFTER the crop the visible region is
+        # still at full target resolution (real detail), not a magnified blur.
+        upscaler = self.cfg.get("upscaler", "")
+        if upscaler and upscaler.lower() not in ("", "lanczos", "none"):
+            long_edge = (max(target) if target else self.gen_res) * overscan
+            factor = max(1, min(4, -(-int(long_edge) // self.gen_res)))  # ceil
+            seq = self._neural_upscale(seq, factor, upscaler)
+
         vf = self._scale_filter(target, self.cfg.get("fit", "cover"), overscan)
         # Motion smoothing: a center-weighted 3-frame temporal blend softens the
         # per-real-frame content "snap" at the edges (a generation discontinuity
