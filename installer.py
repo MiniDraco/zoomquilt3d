@@ -27,6 +27,11 @@ import shutil
 import threading
 import subprocess
 
+try:
+    import requests
+except ImportError:
+    requests = None
+
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
@@ -85,17 +90,56 @@ BACKENDS = [
     },
 ]
 
-# Recommended fast models for scenery (few-step). Filenames + where they live.
+# Downloadable fast models. `file` is the preferred filename; if it's missing
+# from the repo at download time we fall back to the largest .safetensors.
+# kind -> subfolder under <backend>/models/ (Stable-diffusion or Lora).
 FAST_MODELS = [
-    ("SDXL-Lightning 4-step UNet", "ByteDance/SDXL-Lightning",
-     "models/Stable-diffusion (or checkpoints) - 4-step, deployable"),
-    ("Hyper-SD LoRA (1-8 step)", "ByteDance/Hyper-SD",
-     "models/Lora - add to any SD/SDXL checkpoint, best quality/step"),
-    ("SD/SDXL-Turbo", "stabilityai/sdxl-turbo",
-     "models/Stable-diffusion - 1-2 step, fastest"),
-    ("FLUX.1-schnell", "black-forest-labs/FLUX.1-schnell",
-     "models/Stable-diffusion - 4-step Flux, top detail"),
+    {"key": "SDXL-Turbo (standalone checkpoint)",
+     "repo": "stabilityai/sdxl-turbo",
+     "file": "sd_xl_turbo_1.0_fp16.safetensors",
+     "kind": "checkpoint", "note": "1-2 step, works alone, ~6.9 GB"},
+    {"key": "SD-Turbo (standalone, smaller)",
+     "repo": "stabilityai/sd-turbo",
+     "file": "sd_turbo.safetensors",
+     "kind": "checkpoint", "note": "SD2.1 turbo, great at 512-640, ~2.5 GB"},
+    {"key": "SDXL-Lightning 4-step (LoRA)",
+     "repo": "ByteDance/SDXL-Lightning",
+     "file": "sdxl_lightning_4step_lora.safetensors",
+     "kind": "lora", "note": "add to any SDXL base, 4 step, ~390 MB"},
+    {"key": "Hyper-SD SDXL 8-step (LoRA)",
+     "repo": "ByteDance/Hyper-SD",
+     "file": "Hyper-SDXL-8steps-lora.safetensors",
+     "kind": "lora", "note": "add to any SDXL base, best quality/step, ~700 MB"},
+    {"key": "LCM-LoRA SD1.5",
+     "repo": "latent-consistency/lcm-lora-sdv1-5",
+     "file": "pytorch_lora_weights.safetensors",
+     "kind": "lora", "note": "add to any SD1.5 base, ~135 MB"},
 ]
+HF_BASE = "https://huggingface.co"
+
+
+def resolve_model_file(repo, preferred):
+    """Confirm `preferred` exists in the repo; else pick the largest
+    .safetensors. Returns a filename or None."""
+    try:
+        r = requests.get(f"https://huggingface.co/api/models/{repo}",
+                         timeout=15)
+        r.raise_for_status()
+        sibs = r.json().get("siblings", [])
+        names = [s.get("rfilename", "") for s in sibs]
+        safes = [n for n in names if n.endswith(".safetensors")]
+        if preferred in names:
+            return preferred
+        if not safes:
+            return None
+        # heuristics: prefer a name containing the preferred stem, else first
+        stem = os.path.splitext(preferred)[0].lower()
+        for n in safes:
+            if stem in n.lower():
+                return n
+        return safes[0]
+    except Exception:
+        return preferred   # try the preferred name directly
 
 
 def _start_api_bat(b):
@@ -198,15 +242,25 @@ class InstallerApp:
         self.status = ttk.Label(act, text="", foreground="gray")
         self.status.pack(side="right")
 
-        # Recommended models
-        rec = ttk.LabelFrame(main, text="Recommended FAST models for scenery "
-                                        "(few-step = faster gen)", padding=6)
+        # Downloadable fast models (into the selected backend's models folder)
+        rec = ttk.LabelFrame(main, text="FAST models - select (Ctrl/Shift) then "
+                                        "Download into the chosen backend",
+                             padding=6)
         rec.pack(fill="x", pady=(6, 6))
-        for name, repo, where in FAST_MODELS:
-            ttk.Label(rec, text=f"• {name}  -  huggingface.co/{repo}",
-                      font=("Segoe UI", 9)).pack(anchor="w")
-            ttk.Label(rec, text=f"     {where}", foreground="gray",
-                      font=("Segoe UI", 8)).pack(anchor="w")
+        mrow = ttk.Frame(rec)
+        mrow.pack(fill="x")
+        self.models_list = tk.Listbox(mrow, selectmode="extended", height=5,
+                                      exportselection=False)
+        for mdl in FAST_MODELS:
+            self.models_list.insert("end", f"{mdl['key']}  ({mdl['note']})")
+        self.models_list.pack(side="left", fill="x", expand=True)
+        self.dl_btn = ttk.Button(mrow, text="Download selected",
+                                 command=self.download_models)
+        self.dl_btn.pack(side="left", padx=(6, 0), anchor="n")
+        ttk.Label(rec, text="Checkpoints work standalone; LoRAs need a base "
+                            "model (the Turbo checkpoints double as bases).",
+                  foreground="#777", font=("Segoe UI", 8)).pack(anchor="w",
+                                                                pady=(2, 0))
 
         # Log
         self.log = scrolledtext.ScrolledText(main, height=12, wrap="word",
@@ -312,6 +366,65 @@ class InstallerApp:
         except Exception:
             pass
 
+    # ----- model downloads -------------------------------------------------
+    def download_models(self):
+        if requests is None:
+            messagebox.showerror("Missing", "`requests` not installed.")
+            return
+        sel = list(self.models_list.curselection())
+        if not sel:
+            messagebox.showinfo("Pick models", "Select one or more models.")
+            return
+        b = self._selected()
+        dest = self._dest(b)
+        models = [FAST_MODELS[i] for i in sel]
+        self.dl_btn.config(state="disabled")
+        self.status.config(text="downloading...")
+        self._log(f"\n=== Downloading {len(models)} model(s) into "
+                  f"{b['title']} ===")
+        threading.Thread(target=self._download_worker,
+                         args=(dest, models), daemon=True).start()
+
+    def _download_worker(self, backend_dir, models):
+        for mdl in models:
+            try:
+                self._download_one(backend_dir, mdl)
+            except Exception as e:
+                self.events.put(("log", f"  {mdl['key']}: FAILED - {e}"))
+        self.events.put(("log", "Model downloads finished."))
+        self.events.put(("dldone", None))
+
+    def _download_one(self, backend_dir, mdl):
+        sub = "Lora" if mdl["kind"] == "lora" else "Stable-diffusion"
+        folder = os.path.join(backend_dir, "models", sub)
+        os.makedirs(folder, exist_ok=True)
+        self.events.put(("log", f"  {mdl['key']}: resolving in {mdl['repo']}..."))
+        fname = resolve_model_file(mdl["repo"], mdl["file"]) or mdl["file"]
+        out = os.path.join(folder, os.path.basename(fname))
+        if os.path.isfile(out) and os.path.getsize(out) > 1_000_000:
+            self.events.put(("log", f"  {mdl['key']}: already present, skip."))
+            return
+        url = f"{HF_BASE}/{mdl['repo']}/resolve/main/{fname}?download=true"
+        self.events.put(("log", f"  downloading {fname} -> models/{sub}/"))
+        r = requests.get(url, stream=True, timeout=60)
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        done = last = 0
+        tmp = out + ".part"
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                done += len(chunk)
+                if total and done - last > total * 0.1:
+                    last = done
+                    self.events.put(("log",
+                        f"    {mdl['key']}: {done / 1e9:.2f}/"
+                        f"{total / 1e9:.2f} GB ({done * 100 // total}%)"))
+        os.replace(tmp, out)
+        self.events.put(("log", f"  {mdl['key']}: done -> {out}"))
+
     # ----- event pump ------------------------------------------------------
     def _drain(self):
         try:
@@ -324,6 +437,9 @@ class InstallerApp:
                 elif kind == "done":
                     self.install_btn.config(state="normal")
                     self.status.config(text="")
+                elif kind == "dldone":
+                    self.dl_btn.config(state="normal")
+                    self.status.config(text="models ready")
         except queue.Empty:
             pass
         self.root.after(100, self._drain)
