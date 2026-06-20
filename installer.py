@@ -146,15 +146,30 @@ def _start_api_bat(b):
     """Return the contents of the start-api.bat for a given backend dict."""
     t = b["type"]
     if t == "a1111":
-        # Self-installing WebUI: set API flags then hand off to webui.bat.
+        # Self-installing WebUI. Force a torch-compatible Python (3.10/3.11):
+        # these WebUIs pin old torch that has NO wheels for 3.13/3.14, so a
+        # default 3.14 venv fails on "Couldn't install torch".
         return (
             "@echo off\r\n"
             "cd /d \"%~dp0\"\r\n"
-            "echo Starting {title} with API on 127.0.0.1:{port} ...\r\n"
+            "set \"PYTHON=\"\r\n"
+            "call :findpy 3.11\r\n"
+            "call :findpy 3.10\r\n"
+            "call :findpy 3.12\r\n"
+            "if not defined PYTHON echo WARNING: no Python 3.10-3.12 found - "
+            "Forge needs one (3.13/3.14 lack torch wheels).\r\n"
+            "echo Starting {title} with API on 127.0.0.1:{port}  "
+            "(Python=%PYTHON%)\r\n"
             "echo (first run downloads dependencies - this can take a while)\r\n"
             "set COMMANDLINE_ARGS=--api --api-log --port {port}\r\n"
             "call webui.bat\r\n"
             "pause\r\n"
+            "exit /b\r\n"
+            ":findpy\r\n"
+            "if defined PYTHON exit /b\r\n"
+            "py -%~1 --version >nul 2>&1 || exit /b\r\n"
+            "for /f \"delims=\" %%p in ('py -%~1 -c \"import sys;print(sys.executable)\"') do set \"PYTHON=%%p\"\r\n"
+            "exit /b\r\n"
         ).format(title=b["title"], port=API_PORT)
     if t == "sdnext":
         return (

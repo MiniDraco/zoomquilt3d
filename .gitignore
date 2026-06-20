@@ -56,3 +56,12 @@ checkpoints/
 *.log
 .DS_Store
 Thumbs.db
+
+# zoomquilt local (restored)
+backends/
+renders/
+output/
+.part
+_*/
+_*.png
+scratch_*/
