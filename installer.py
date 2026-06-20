@@ -290,9 +290,11 @@ class InstallerApp:
             return
         b = self._selected()
         dest = self._dest(b)
-        if os.path.isdir(dest) and os.listdir(dest):
+        # A real clone is detected by .git - NOT just a non-empty folder, since
+        # downloading models first creates dest/models/ before the clone.
+        if os.path.isdir(os.path.join(dest, ".git")):
             if not messagebox.askyesno(
-                    "Already exists",
+                    "Already installed",
                     f"{b['title']} already cloned at:\n{dest}\n\n"
                     "Re-write the start-api.bat only (keep the clone)?"):
                 return
@@ -308,9 +310,16 @@ class InstallerApp:
 
     def _clone(self, b, dest):
         os.makedirs(BACKENDS_DIR, exist_ok=True)
+        # If dest already has content (e.g. pre-downloaded models), git clone
+        # would refuse it. Clone into a temp dir, then merge into dest so the
+        # downloads are preserved.
+        merge = os.path.isdir(dest) and os.listdir(dest)
+        target = (dest + "__cloning") if merge else dest
+        if merge and os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
         try:
             proc = subprocess.Popen(
-                ["git", "clone", "--progress", b["url"], dest],
+                ["git", "clone", "--progress", b["url"], target],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1)
             for line in proc.stdout:
@@ -320,11 +329,28 @@ class InstallerApp:
                 self.events.put(("log", "ERROR: git clone failed."))
                 self.events.put(("done", None))
                 return
+            if merge:
+                self.events.put(("log", "  merging clone with existing files "
+                                        "(keeping downloaded models)..."))
+                self._merge_into(target, dest)
+                shutil.rmtree(target, ignore_errors=True)
         except Exception as e:
             self.events.put(("log", f"ERROR: {e}"))
             self.events.put(("done", None))
             return
         self.events.put(("setup", (b, dest)))
+
+    @staticmethod
+    def _merge_into(src, dst):
+        """Move everything from src into dst; existing files in dst win."""
+        for root, _dirs, files in os.walk(src):
+            rel = os.path.relpath(root, src)
+            target_dir = os.path.join(dst, rel) if rel != "." else dst
+            os.makedirs(target_dir, exist_ok=True)
+            for fn in files:
+                d = os.path.join(target_dir, fn)
+                if not os.path.exists(d):
+                    shutil.move(os.path.join(root, fn), d)
 
     def _finish_setup(self, b, dest):
         """Write start-api.bat (runs on the Tk thread)."""
