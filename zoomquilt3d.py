@@ -2183,9 +2183,24 @@ def main():
     if np is None:
         print("FATAL: numpy is required.  pip install numpy", file=sys.stderr)
         return
+    # Optional launcher hand-off: preselect API URL + checkpoint.
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--api", default=None)
+    ap.add_argument("--model", default=None)
+    args, _ = ap.parse_known_args()
+
     root = tk.Tk()
     apply_theme(root)
-    ZoomquiltApp(root)
+    app = ZoomquiltApp(root)
+    if args.api:
+        app.api_var.set(args.api)
+    if args.model:
+        # add to the dropdown values and select it (loads on first gen)
+        vals = list(app.model_combo.cget("values"))
+        if args.model not in vals:
+            app.model_combo.config(values=vals + [args.model])
+        app.model_var.set(args.model)
     root.mainloop()
 
 

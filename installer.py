@@ -249,13 +249,27 @@ class InstallerApp:
         self.install_btn = ttk.Button(act, text="Install selected",
                                       command=self.install)
         self.install_btn.pack(side="left")
-        self.launch_btn = ttk.Button(act, text="Launch (start API)",
-                                     command=self.launch)
-        self.launch_btn.pack(side="left", padx=(6, 0))
         ttk.Button(act, text="Open backends folder",
                    command=self.open_folder).pack(side="left", padx=(6, 0))
         self.status = ttk.Label(act, text="", foreground="gray")
         self.status.pack(side="right")
+
+        # ---- Launch row: choose server + model, bring both up ----
+        lr = ttk.LabelFrame(main, text="Launch", padding=6)
+        lr.pack(fill="x", pady=(2, 6))
+        ttk.Label(lr, text="Model:").pack(side="left")
+        self.model_var = tk.StringVar(value="(backend default)")
+        self.model_combo = ttk.Combobox(lr, width=34, state="readonly",
+                                        textvariable=self.model_var,
+                                        values=["(backend default)"],
+                                        postcommand=self._scan_models)
+        self.model_combo.pack(side="left", padx=(4, 8))
+        ttk.Button(lr, text="🚀 Launch backend + app",
+                   command=self.launch_both).pack(side="left")
+        ttk.Button(lr, text="Backend only",
+                   command=self.launch).pack(side="left", padx=(6, 0))
+        # refresh the model list when the backend selection changes
+        self.choice.trace_add("write", lambda *a: self._scan_models())
 
         # Downloadable fast models (into the selected backend's models folder)
         rec = ttk.LabelFrame(main, text="FAST models - select (Ctrl/Shift) then "
@@ -386,19 +400,59 @@ class InstallerApp:
         self.install_btn.config(state="normal")
 
     # ----- launch ----------------------------------------------------------
+    def _scan_models(self):
+        """Populate the model dropdown from the selected backend's checkpoints."""
+        b = self._selected()
+        dest = self._dest(b)
+        names = ["(backend default)"]
+        for sub in ("models/Stable-diffusion", "models/checkpoints", "models"):
+            d = os.path.join(dest, *sub.split("/"))
+            if os.path.isdir(d):
+                for fn in sorted(os.listdir(d)):
+                    if fn.lower().endswith((".safetensors", ".ckpt")):
+                        if fn not in names:
+                            names.append(fn)
+        self.model_combo.config(values=names)
+        if self.model_var.get() not in names:
+            self.model_var.set("(backend default)")
+
     def launch(self):
         b = self._selected()
         bat = os.path.join(self._dest(b), "start-api.bat")
         if not os.path.isfile(bat):
             messagebox.showinfo("Not installed",
                                 f"Install {b['title']} first.")
-            return
+            return False
         try:
             os.startfile(bat)            # opens in its own console window
             self._log(f"Launched {b['title']} ({bat}). "
                       "Wait for 'Running on local URL' in its window.")
+            return True
         except Exception as e:
             messagebox.showerror("Launch failed", str(e))
+            return False
+
+    def launch_both(self):
+        """Start the chosen backend AND the Zoomquilt app (with model preset)."""
+        if not self.launch():
+            return
+        # find the app + a python to run it
+        app_py = os.path.join(HERE, "zoomquilt3d.py")
+        if not os.path.isfile(app_py):
+            messagebox.showerror("Missing", "zoomquilt3d.py not found.")
+            return
+        venv_py = os.path.join(HERE, ".venv", "Scripts", "pythonw.exe")
+        py = venv_py if os.path.isfile(venv_py) else sys.executable
+        cmd = [py, app_py, "--api", f"http://127.0.0.1:{API_PORT}"]
+        model = self.model_var.get()
+        if model and model != "(backend default)":
+            cmd += ["--model", model]
+        try:
+            subprocess.Popen(cmd, cwd=HERE)
+            self._log("Launched the Zoomquilt app. The backend takes a minute "
+                      "to come online - watch for the green 'gen online' dot.")
+        except Exception as e:
+            messagebox.showerror("App launch failed", str(e))
 
     def open_folder(self):
         os.makedirs(BACKENDS_DIR, exist_ok=True)
