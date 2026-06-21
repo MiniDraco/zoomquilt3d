@@ -209,7 +209,7 @@ def _start_api_bat(b):
 class InstallerApp:
     def __init__(self, root):
         self.root = root
-        root.title("Zoomquilt - Image-Gen Backend Installer")
+        root.title("Zoomquilt - Setup & Launch")
         root.geometry("820x620")
         root.minsize(720, 560)
 
@@ -224,7 +224,8 @@ class InstallerApp:
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill="both", expand=True)
 
-        ttk.Label(main, text="Choose an image-generation backend to install",
+        ttk.Label(main, text="1) Install a backend   2) Download a model   "
+                             "3) Launch backend + app",
                   font=("Segoe UI", 11, "bold")).pack(anchor="w")
         ttk.Label(main,
                   text="The Zoomquilt app connects over the A1111 API on "

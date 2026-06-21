@@ -37,22 +37,21 @@ Highlights:
 
 ## Quick start
 
-```bat
-:: 1. one-time setup (builds a Python 3.11 venv with CUDA torch + transformers)
-setup.bat
+**Double-click `start.bat`.** That's it.
 
-:: 2. install an image-gen backend (pick one of 5) and launch it with the API on
-install.bat
+On the first run it installs Python 3.11 / Git / ffmpeg if they're missing (via `winget`) and builds the environment, then opens the hub. In the hub:
 
-:: 3. run the app
-launch.bat
-```
+1. **Install** an image-gen backend (pick one of 5)
+2. **Download** a fast model into it
+3. **🚀 Launch backend + app** — pick your model and it brings both up
 
-In the app: **Test Connection** (it auto-detects when the backend is online) → set keyframe prompts → **Generate Zoomquilt**. The finished video lands in `renders/`.
+In the app: it auto-detects when the backend is online → set keyframe prompts → **Generate Zoomquilt**. The finished video lands in `renders/`.
 
-### Backend installer
+> Power-user shortcuts: `launch.bat` runs just the app (when a backend's already up); `make-theme.bat` generates a new themed prompt bank.
 
-`install.bat` opens a small GUI that git-clones and configures your choice of:
+### Backends
+
+The hub git-clones and configures your choice of:
 
 | Backend | Plug-and-play* | Notes |
 |---------|:---:|-------|
@@ -70,14 +69,15 @@ For fast scenery generation, drop a few-step model (SDXL-Lightning, Hyper-SD, SD
 
 | File | Purpose |
 |------|---------|
+| **`start.bat`** | **One-click: first-run setup + the hub (install backend, model, launch)** |
 | `zoomquilt3d.py` | The app (single file) |
-| `installer.py` / `install.bat` | Backend installer & launcher |
+| `installer.py` | The hub GUI (opened by start.bat) |
+| `setup.ps1` | First-run bootstrap (winget Python 3.11 / Git / ffmpeg + venv) |
 | `prompts/` | Prompt banks (`*.txt`, one prompt per line) shown in the dropdown |
 | `build_prompt_bank.py` | Regenerates `prompts/landscapes.txt` (5,000 prompts) |
 | `build_theme_banks.py` | Regenerates the noir/space/trippy/creepy banks |
 | `theme_gen.py` / `make-theme.bat` | Generate a new themed bank from a typed theme (Ollama) |
-| `setup.bat` | Builds the Python 3.11 venv |
-| `launch.bat` | Runs the app |
+| `launch.bat` | Run just the app (when a backend is already up) |
 
 ## License
 
